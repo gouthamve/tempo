@@ -57,7 +57,7 @@ func (c *Client) FGetObject(ctx context.Context, bucketName, objectName, filePat
 	objectDir, _ := filepath.Split(filePath)
 	if objectDir != "" {
 		// Create any missing top level directories.
-		if err := os.MkdirAll(objectDir, 0700); err != nil {
+		if err := os.MkdirAll(objectDir, 0o700); err != nil {
 			return err
 		}
 	}
@@ -69,10 +69,10 @@ func (c *Client) FGetObject(ctx context.Context, bucketName, objectName, filePat
 	}
 
 	// Write to a temporary file "fileName.part.minio" before saving.
-	filePartPath := filePath + objectStat.ETag + ".part.minio"
+	filePartPath := filepath.Join(filepath.Dir(filePath), sum256Hex([]byte(filepath.Base(filePath)+objectStat.ETag))+".part.minio")
 
 	// If exists, open in append mode. If not create it as a part file.
-	filePart, err := os.OpenFile(filePartPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	filePart, err := os.OpenFile(filePartPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
