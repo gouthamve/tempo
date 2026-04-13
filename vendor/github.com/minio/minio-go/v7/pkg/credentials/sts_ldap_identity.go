@@ -1,6 +1,6 @@
 /*
  * MinIO Go Library for Amazon S3 Compatible Cloud Storage
- * Copyright 2019-2021 MinIO, Inc.
+ * Copyright 2019-2022 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,14 @@
 package credentials
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -53,7 +56,8 @@ type LDAPIdentityResult struct {
 type LDAPIdentity struct {
 	Expiry
 
-	// Required http Client to use when connecting to MinIO STS service.
+	// Optional http Client to use when connecting to MinIO STS service.
+	// (overrides default client in CredContext)
 	Client *http.Client
 
 	// Exported STS endpoint to fetch STS credentials.
@@ -69,13 +73,18 @@ type LDAPIdentity struct {
 	// RequestedExpiry is the configured expiry duration for credentials
 	// requested from LDAP.
 	RequestedExpiry time.Duration
+
+	// Optional, if empty applies to default config
+	ConfigName string
+
+	// Optional, used for token revokation
+	TokenRevokeType string
 }
 
 // NewLDAPIdentity returns new credentials object that uses LDAP
 // Identity.
 func NewLDAPIdentity(stsEndpoint, ldapUsername, ldapPassword string, optFuncs ...LDAPIdentityOpt) (*Credentials, error) {
 	l := LDAPIdentity{
-		Client:       &http.Client{Transport: http.DefaultTransport},
 		STSEndpoint:  stsEndpoint,
 		LDAPUsername: ldapUsername,
 		LDAPPassword: ldapPassword,
@@ -104,30 +113,20 @@ func LDAPIdentityExpiryOpt(d time.Duration) LDAPIdentityOpt {
 	}
 }
 
-func stripPassword(err error) error {
-	urlErr, ok := err.(*url.Error)
-	if ok {
-		u, _ := url.Parse(urlErr.URL)
-		if u == nil {
-			return urlErr
-		}
-		values := u.Query()
-		values.Set("LDAPPassword", "xxxxx")
-		u.RawQuery = values.Encode()
-		urlErr.URL = u.String()
-		return urlErr
+// LDAPIdentityConfigNameOpt sets the config name for requested credentials.
+func LDAPIdentityConfigNameOpt(name string) LDAPIdentityOpt {
+	return func(k *LDAPIdentity) {
+		k.ConfigName = name
 	}
-	return err
 }
 
 // NewLDAPIdentityWithSessionPolicy returns new credentials object that uses
 // LDAP Identity with a specified session policy. The `policy` parameter must be
 // a JSON string specifying the policy document.
 //
-// DEPRECATED: Use the `LDAPIdentityPolicyOpt` with `NewLDAPIdentity` instead.
+// Deprecated: Use the `LDAPIdentityPolicyOpt` with `NewLDAPIdentity` instead.
 func NewLDAPIdentityWithSessionPolicy(stsEndpoint, ldapUsername, ldapPassword, policy string) (*Credentials, error) {
 	return New(&LDAPIdentity{
-		Client:       &http.Client{Transport: http.DefaultTransport},
 		STSEndpoint:  stsEndpoint,
 		LDAPUsername: ldapUsername,
 		LDAPPassword: ldapPassword,
@@ -135,10 +134,22 @@ func NewLDAPIdentityWithSessionPolicy(stsEndpoint, ldapUsername, ldapPassword, p
 	}), nil
 }
 
-// Retrieve gets the credential by calling the MinIO STS API for
+// RetrieveWithCredContext gets the credential by calling the MinIO STS API for
 // LDAP on the configured stsEndpoint.
-func (k *LDAPIdentity) Retrieve() (value Value, err error) {
-	u, err := url.Parse(k.STSEndpoint)
+func (k *LDAPIdentity) RetrieveWithCredContext(cc *CredContext) (value Value, err error) {
+	if cc == nil {
+		cc = defaultCredContext
+	}
+
+	stsEndpoint := k.STSEndpoint
+	if stsEndpoint == "" {
+		stsEndpoint = cc.Endpoint
+	}
+	if stsEndpoint == "" {
+		return Value{}, errors.New("STS endpoint unknown")
+	}
+
+	u, err := url.Parse(stsEndpoint)
 	if err != nil {
 		return value, err
 	}
@@ -154,27 +165,56 @@ func (k *LDAPIdentity) Retrieve() (value Value, err error) {
 	if k.RequestedExpiry != 0 {
 		v.Set("DurationSeconds", fmt.Sprintf("%d", int(k.RequestedExpiry.Seconds())))
 	}
-
-	u.RawQuery = v.Encode()
-
-	req, err := http.NewRequest(http.MethodPost, u.String(), nil)
-	if err != nil {
-		return value, stripPassword(err)
+	if k.TokenRevokeType != "" {
+		v.Set("TokenRevokeType", k.TokenRevokeType)
+	}
+	if k.ConfigName != "" {
+		v.Set("ConfigName", k.ConfigName)
 	}
 
-	resp, err := k.Client.Do(req)
+	req, err := http.NewRequest(http.MethodPost, u.String(), strings.NewReader(v.Encode()))
 	if err != nil {
-		return value, stripPassword(err)
+		return value, err
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := k.Client
+	if client == nil {
+		client = cc.Client
+	}
+	if client == nil {
+		client = defaultCredContext.Client
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return value, err
 	}
 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return value, errors.New(resp.Status)
+		var errResp ErrorResponse
+		buf, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return value, err
+		}
+		_, err = xmlDecodeAndBody(bytes.NewReader(buf), &errResp)
+		if err != nil {
+			var s3Err Error
+			if _, err = xmlDecodeAndBody(bytes.NewReader(buf), &s3Err); err != nil {
+				return value, err
+			}
+			errResp.RequestID = s3Err.RequestID
+			errResp.STSError.Code = s3Err.Code
+			errResp.STSError.Message = s3Err.Message
+		}
+		return value, errResp
 	}
 
 	r := AssumeRoleWithLDAPResponse{}
 	if err = xml.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return
+		return value, err
 	}
 
 	cr := r.Result.Credentials
@@ -183,6 +223,13 @@ func (k *LDAPIdentity) Retrieve() (value Value, err error) {
 		AccessKeyID:     cr.AccessKey,
 		SecretAccessKey: cr.SecretKey,
 		SessionToken:    cr.SessionToken,
+		Expiration:      cr.Expiration,
 		SignerType:      SignatureV4,
 	}, nil
+}
+
+// Retrieve gets the credential by calling the MinIO STS API for
+// LDAP on the configured stsEndpoint.
+func (k *LDAPIdentity) Retrieve() (value Value, err error) {
+	return k.RetrieveWithCredContext(defaultCredContext)
 }
